@@ -80,9 +80,8 @@ git config --global --add \
   '!"/absolute/path/to/git-credential-github-app/git-credential-github-app" --app-id 123456 --installation-id 98765432 --owner YOUR_OWNER --key-file "/absolute/path/to/app.pem"'
 ```
 
-The helper can stay in your workspace; installing into `~/.local/bin` is optional.
-For example, the helper path could be
-`/Users/ai/Workspace/git-credential-github-app/git-credential-github-app`.
+The helper can run directly from any checkout; installing into `~/.local/bin`
+is optional. Use the absolute path to the helper in your Git configuration.
 Keep it executable (`chmod +x /absolute/path/to/helper`) and keep the private key
 outside the repository. If you move the helper, update Git config accordingly.
 
