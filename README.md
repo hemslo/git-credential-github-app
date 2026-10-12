@@ -197,5 +197,3 @@ local Git repository. No real credentials or network access are required.
 - [Official Bash JWT example](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-json-web-token-jwt-for-a-github-app)
 - [Installation token exchange](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-an-installation-access-token-for-a-github-app)
 - [Git credential helper protocol](https://git-scm.com/docs/gitcredentials)
-
-Independent project; not an official GitHub product.
