@@ -1,15 +1,14 @@
 # git-credential-github-app
 
-A small Bash Git credential helper for GitHub App installations. No daemon,
-token cache, or Python runtime dependencies.
+A small Bash Git credential helper and optional `gh` wrapper for GitHub App
+installations. No daemon or Python runtime dependencies.
 
 ```text
 Private key → signed JWT → GitHub installation token → HTTPS Git
 ```
 
-Requests a fresh token for the current repository with only `contents`
-permission. GitHub enforces the app installation's selected repositories and
-permissions. Works with any automation that uses Git, including AI agents.
+By default, Git and `gh` share a cached token with all repositories and
+permissions granted to the app installation. GitHub enforces that access. Works with any automation that uses Git, including AI agents.
 
 ## Requirements
 
@@ -47,7 +46,8 @@ credential helper configuration. Keep the private key outside this project.
 | `--installation-id` | Numeric installation ID (required) |
 | `--owner` | GitHub user or organization owning the repositories (required) |
 | `--key-file` | Absolute path or `~/` path to the private key (required) |
-| `--contents-permission` | `read` or `write`, defaults to `write` |
+| `--contents-permission` | Optional: restrict to Contents `read` or `write`; Git mode also restricts to the requested repository |
+| `--cache-dir` | Absolute cache directory; defaults to `${XDG_CACHE_HOME:-$HOME/.cache}/git-credential-github-app` |
 
 Put flags before the operation (`get`, `store`, or `erase`), which Git appends
 automatically. IDs and key paths are not secrets; private key contents never
@@ -146,6 +146,56 @@ persist in the new checkout. Subsequent `git fetch`, `pull`, and `push` use the
 helper automatically. Use different flag values in another checkout for another
 installation. Add `--contents-permission read` for fetch-only credentials.
 
+## GitHub CLI and agent setup
+
+The optional `bin/gh` wrapper uses the same JWT/token exchange and cache as Git.
+Both send an empty token request (`{}`) by default, inheriting all repositories
+and permissions granted to the installation. Manage access in GitHub; no local
+permission list is required. Explicit `--contents-permission` restrictions use
+separate cache entries. In `token` mode that option restricts permissions only;
+in Git mode it also restricts access to the requested repository.
+
+Keep the checkout in place and configure the environment of the shell or agent
+that runs `gh` (replace all example values):
+
+```bash
+export GH_APP_ID=123456
+export GH_APP_INSTALLATION_ID=98765432
+export GH_APP_OWNER=YOUR_OWNER
+export GH_APP_KEY_FILE="/absolute/path/to/app.pem"
+export GH_APP_GH_BIN="/absolute/path/to/real/gh"
+export PATH="/absolute/path/to/git-credential-github-app/bin:$PATH"
+gh pr list --repo YOUR_OWNER/YOUR_REPO
+```
+
+Find the real binary with `command -v gh` **before** changing PATH (Homebrew on
+Apple Silicon typically installs it at `/opt/homebrew/bin/gh`). The wrapper
+passes arguments, output, and exit status through, and replaces any inherited
+`GH_TOKEN` for its child process. No personal `gh auth login` is required.
+For agents, make these variables and PATH available to the command execution
+environment. Tell the agent authentication is automatic. For zsh login sessions,
+place exports in `~/.zprofile` after any Homebrew setup; non-login execution
+needs an inherited environment or its own startup configuration.
+
+Tokens are cached under `${XDG_CACHE_HOME:-$HOME/.cache}/git-credential-github-app`
+and renewed when fewer than 60 seconds remain. Directory/file permissions are
+700/600; writes are atomic. Cache entries separate app IDs, installation IDs,
+owners, token request bodies, and public-key fingerprints. Git and `gh` reuse
+the same entry when those inputs match. Concurrent cold starts may
+mint more than one token; subsequent calls reuse the cached token.
+Delete the corresponding cache file to refresh early after revocation or changed
+installation access. Failed commands are not automatically retried, to avoid
+repeating writes. A running `gh` process does not refresh its token mid-command.
+Commands requiring permissions not granted to the installation, or requiring
+user authentication, remain unavailable. After changing permissions, clear the
+cache to obtain a token with the new grants.
+
+For other integrations, the helper also supports `token` with the same identity
+flags and optional `--cache-dir /absolute/path`. It prints the raw cached token
+to stdout: capture it rather than displaying it in agent logs. The `token`
+operation does not read Git credential input. The existing Git helper install
+command alone does not install the optional wrapper; run it from the checkout.
+
 ## Commit identity is separate
 
 This helper changes authentication only. If desired, configure a verified email
@@ -159,24 +209,28 @@ git config --local user.email 'your-verified-agent-alias@example.com'
 ## Behavior and limitations
 
 - `get`: validates HTTPS host, repository path, arguments, and installation owner;
-  signs an RS256 JWT; requests a repository-scoped token; returns Git credentials.
-- `store` / `erase`: no-ops. Tokens are never cached or written to disk.
+  returns a cached token, or signs an RS256 JWT and requests a fresh token.
+  Installation owner is checked when minting; cached tokens reuse that check.
+- `store`: no-op. `erase`: removes the matching cache entry without a network
+  request. With default settings this also invalidates the shared `gh` cache;
+  it does not revoke tokens already held by other processes.
 - Unrelated hosts/owners: returns no credentials, allowing another helper to run.
 - Failures for the configured owner: emits `quit=true` to prevent falling back
   to personal credentials. Errors go to stderr, not the credential stream.
-- Installation tokens expire after one hour; each credential request gets a new
-  one. This adds API latency and may hit rate limits at high volume.
+- Installation tokens expire after one hour; cached tokens are reused until
+  60 seconds before expiry. Existing restricted caches use different keys from
+  the new default and are not reused.
 - Protect the private key like an SSH key. Processes that can read it can request
   tokens within the app's full granted access; this helper is not a sandbox.
   Avoid shell tracing and credential-debug output.
-- No `gh` authentication, PR management, repository creation, branch-protection
-  bypass, commit signing, or keychain storage is included.
+- The optional wrapper supplies `gh` authentication; Git mode does not. Neither
+  mode configures commit signing, branch-protection bypass, or keychain storage.
 
 ## Publishing this project
 
 The helper can push to an existing repository once the app has access. Creating
 a repository through the app is a separate GitHub API operation requiring
-additional permissions; its contents-only tokens intentionally cannot do that.
+appropriate installation permissions. This helper does not create repositories.
 Choose the owner/visibility and grant creation permissions separately, or create
 the repository in GitHub's UI and select it in the app installation.
 
@@ -186,6 +240,7 @@ A license and release version should be chosen before public distribution.
 
 ```bash
 bash -n git-credential-github-app
+bash -n bin/gh
 python3 -B -m unittest discover -s tests -v
 ```
 
