@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Put this directory before the real gh on the agent's PATH.
+set +x
+set -euo pipefail
+: "${GH_APP_ID:?Set GH_APP_ID}"
+: "${GH_APP_INSTALLATION_ID:?Set GH_APP_INSTALLATION_ID}"
+: "${GH_APP_OWNER:?Set GH_APP_OWNER}"
+: "${GH_APP_KEY_FILE:?Set GH_APP_KEY_FILE}"
+: "${GH_APP_GH_BIN:?Set GH_APP_GH_BIN to the absolute path of the real gh}"
+[[ "$GH_APP_GH_BIN" == /* && -x "$GH_APP_GH_BIN" && ! "$GH_APP_GH_BIN" -ef "$0" ]] || {
+  echo 'gh wrapper: GH_APP_GH_BIN must point to the real gh executable.' >&2
+  exit 1
+}
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+GH_TOKEN=$("$root/git-credential-github-app" \
+  --app-id "$GH_APP_ID" --installation-id "$GH_APP_INSTALLATION_ID" \
+  --owner "$GH_APP_OWNER" --key-file "$GH_APP_KEY_FILE" token)
+export GH_TOKEN
+exec "$GH_APP_GH_BIN" "$@"

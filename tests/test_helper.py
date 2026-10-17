@@ -1,5 +1,6 @@
 """Offline integration tests: real JWT signing and Git, mocked curl only."""
 import base64
+import datetime
 import json
 import os
 from pathlib import Path
@@ -33,11 +34,11 @@ class HelperTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.values = dict(app_id='123', installation_id='456', owner='example',
-                           private_key=str(self.key), contents_permission='write')
+                           private_key=str(self.key))
         self.log = self.root / 'requests.jsonl'
         fake = self.root / 'curl'
         fake.write_text('''#!/usr/bin/env python3
-import json, os, sys
+import json, os, sys, datetime
 args = sys.argv[1:]
 headers = sys.stdin.read()
 with open(os.environ['REQUEST_LOG'], 'a') as f:
@@ -45,7 +46,7 @@ with open(os.environ['REQUEST_LOG'], 'a') as f:
 if os.environ.get('FAIL_HTTP'):
     sys.exit(22)
 if args[-1].endswith('/access_tokens'):
-    print(json.dumps({'token': os.environ.get('FAKE_TOKEN', 'test-token')}))
+    print(json.dumps({'token': os.environ.get('FAKE_TOKEN', 'test-token'), 'expires_at': os.environ.get('FAKE_EXPIRY', (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M:%SZ'))}))
 else:
     print(json.dumps({'account': {'login': os.environ.get('INSTALL_OWNER', 'example')}}))
 ''')
@@ -96,7 +97,7 @@ else:
         self.assertEqual(verified.returncode, 0)
         args = requests[1]['args']
         self.assertEqual(json.loads(args[args.index('--data') + 1]),
-                         {'repositories': ['repo'], 'permissions': {'contents': 'write'}})
+                         {})
         self.assertNotIn(token, ' '.join(args))
         self.assertEqual(args[0], '--disable')
 
@@ -107,9 +108,9 @@ else:
                 self.assertEqual((r.returncode, r.stdout), (0, ''))
         self.assertFalse(self.log.exists())
 
-    def test_store_erase_need_no_settings(self):
+    def test_store_needs_no_settings(self):
         self.values = {}
-        for op in ('store', 'erase'):
+        for op in ('store',):
             r = self.run_helper(op)
             self.assertEqual((r.returncode, r.stdout), (0, ''))
 
@@ -172,6 +173,119 @@ else:
                 self.assertNotEqual(r.returncode, 0)
                 self.assertEqual(r.stdout, 'quit=true\n\n')
         self.assertFalse(self.log.exists())
+
+    def test_token_cache_reuse_and_scope(self):
+        first = self.run_helper('token')
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(first.stdout, 'test-token\n')
+        self.env['FAIL_HTTP'] = '1'
+        second = self.run_helper('token')
+        self.assertEqual(second.stdout, first.stdout)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(len(self.requests()), 2)
+        args = self.requests()[1]['args']
+        self.assertEqual(json.loads(args[args.index('--data') + 1]),
+                         {})
+        cache = next((self.root / '.cache/git-credential-github-app').glob('*.json'))
+        self.assertEqual(cache.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(cache.parent.stat().st_mode & 0o777, 0o700)
+
+    def test_stale_or_corrupt_cache_refresh(self):
+        self.assertEqual(self.run_helper('token').returncode, 0)
+        cache = next((self.root / '.cache/git-credential-github-app').glob('*.json'))
+        for content in ('{bad', '{"token":"old","expires_at":"2000-01-01T00:00:00Z"}'):
+            cache.write_text(content)
+            result = self.run_helper('token')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, 'test-token\n')
+        self.assertEqual(len(self.requests()), 6)
+
+    def test_near_expiry_refresh_and_failure_does_not_return_stale_token(self):
+        self.assertEqual(self.run_helper('token').returncode, 0)
+        cache = next((self.root / '.cache/git-credential-github-app').glob('*.json'))
+        expiry = (datetime.datetime.now(datetime.timezone.utc) +
+                  datetime.timedelta(seconds=30)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        cache.write_text(json.dumps({'token': 'old', 'expires_at': expiry}))
+        self.env['FAIL_HTTP'] = '1'
+        result = self.run_helper('token')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, '')
+        del self.env['FAIL_HTTP']
+        result = self.run_helper('token')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, 'test-token\n')
+
+    def test_rotated_key_does_not_reuse_cache(self):
+        self.assertEqual(self.run_helper('token').returncode, 0)
+        rotated = self.root / 'rotated.pem'
+        subprocess.run(['openssl', 'genrsa', '-out', str(rotated), '2048'],
+                       check=True, capture_output=True)
+        self.values['private_key'] = str(rotated)
+        self.assertEqual(self.run_helper('token').returncode, 0)
+        self.assertEqual(len(self.requests()), 4)
+
+    def test_git_and_cli_share_default_token_and_erase(self):
+        result = self.run_helper()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.run_helper('token').stdout, 'test-token\n')
+        result = self.run_helper(request='protocol=https\nhost=github.com\npath=example/another\n\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.requests()), 2)
+        result = self.run_helper('erase')
+        self.assertEqual((result.returncode, result.stdout), (0, ''), result.stderr)
+        self.assertEqual(len(self.requests()), 2)
+        self.assertEqual(self.run_helper('token').returncode, 0)
+        self.assertEqual(len(self.requests()), 4)
+
+    def test_explicit_restrictions_have_separate_cache(self):
+        self.assertEqual(self.run_helper('token').returncode, 0)
+        self.values['contents_permission'] = 'read'
+        self.assertEqual(self.run_helper().returncode, 0)
+        args = self.requests()[-1]['args']
+        self.assertEqual(json.loads(args[args.index('--data') + 1]),
+                         {'repositories': ['repo'], 'permissions': {'contents': 'read'}})
+        self.assertEqual(len(self.requests()), 4)
+        self.assertEqual(self.run_helper('erase').returncode, 0)
+        del self.values['contents_permission']
+        self.assertEqual(self.run_helper('token').returncode, 0)
+        self.assertEqual(len(self.requests()), 4)
+
+    def test_cache_separates_installations(self):
+        self.assertEqual(self.run_helper('token').returncode, 0)
+        self.values['installation_id'] = '789'
+        self.assertEqual(self.run_helper('token').returncode, 0)
+        self.assertEqual(len(self.requests()), 4)
+
+    def test_bad_expiry_and_http_failure_no_token_output(self):
+        self.env['FAKE_EXPIRY'] = 'invalid'
+        result = self.run_helper('token')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, '')
+        self.env['FAIL_HTTP'] = '1'
+        result = self.run_helper('token')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, '')
+
+    def test_wrapper_forwards_args_and_reuses_token(self):
+        real = self.root / 'real gh'
+        real.write_text('#!/usr/bin/env python3\nimport os,sys,json\n'
+                        'print(json.dumps([os.environ["GH_TOKEN"],sys.argv[1:]]))\n'
+                        'sys.exit(7)\n')
+        real.chmod(0o755)
+        self.env.update(GH_APP_ID='123', GH_APP_INSTALLATION_ID='456',
+                        GH_APP_OWNER='example', GH_APP_KEY_FILE=str(self.key),
+                        GH_APP_GH_BIN=str(real), GH_TOKEN='old-personal-token')
+        wrapper = HELPER.parent / 'bin/gh'
+        for _ in range(2):
+            result = subprocess.run([str(wrapper), 'pr', 'list', '--search', 'two words'],
+                                    env=self.env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 7, result.stderr)
+            self.assertEqual(json.loads(result.stdout),
+                             ['test-token', ['pr', 'list', '--search', 'two words']])
+        self.assertEqual(len(self.requests()), 2)
+        self.env['GH_APP_GH_BIN'] = str(wrapper)
+        result = subprocess.run([str(wrapper)], env=self.env, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
 
     def test_git_credential_fill_integration(self):
         repo = self.root / 'checkout'
